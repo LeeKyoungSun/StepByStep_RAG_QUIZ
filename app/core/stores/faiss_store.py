@@ -282,8 +282,17 @@ class FaissStore:
                 **payload,
             }
             src = (payload.get("src") or payload.get("source") or
-                   payload.get("source_path") or payload.get("doc") or "")
-            cid = payload.get("chunk_id") or payload.get("id") or id  # 없으면 id로 대체
+                   payload.get("source_path") or payload.get("doc"))
+
+            if not src:
+                src_key = payload.get("_src_local_key")
+                src_dir = payload.get("_src_dir")
+                if src_key:
+                    src = f"{src_dir}/{src_key}"
+                else:
+                    src = src_dir or ""  # 최소한 원본 폴더라도 표시
+
+            cid = payload.get("chunk_id") or payload.get("id") or id
             rec["src"] = src
             rec["chunk_id"] = int(cid) if str(cid).isdigit() else cid
 
@@ -318,8 +327,11 @@ def _search_by_vector(index: faiss.Index, q_vec: np.ndarray, top_k: int = 50, as
 
     dvals = [float(d) for d in D[0][:len(ids)]]
     if metric == faiss.METRIC_L2:
-        scores = [-d for d in dvals]  # L2는 작을수록 가깝다 → 부호 반전
+        # 0~1 범위로 스케일: 거리가 0이면 1, 멀수록 0으로 감소
+        scores = [1.0 / (1.0 + d) for d in dvals]
     else:
-        scores = dvals                # IP는 클수록 가깝다 → 그대로
+        # Inner Product는 이미 큰 값이 유사함을 의미하므로 그대로 사용
+        scores = dvals
+        # IP는 클수록 가깝다 → 그대로
 
     return scores, ids

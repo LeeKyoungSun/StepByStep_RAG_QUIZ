@@ -4,6 +4,7 @@ python-dotenv
 pydantic
 langchain
 langchain-community
+langchain-core
 langchain-openai
 faiss-cpu
 sentence-transformers

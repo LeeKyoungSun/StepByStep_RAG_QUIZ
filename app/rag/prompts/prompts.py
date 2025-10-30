@@ -1,4 +1,4 @@
-#수정 필요
+#기존 챗봇/시나리오용 일반 프롬프트 템플릿 (비-RAG)
 # utils/prompts.py
 # 모든 프롬프트의 단일 소스(Single Source of Truth)
 
