@@ -9,11 +9,11 @@ import json, random, re, os, time, inspect
 
 from openai import OpenAI
 
-from utils.prompts import SCENARIO_PROMPT, USER_TMPL
-from scenarios.keyword_rules import match_keywords
+from app.rag.prompts import CHATBOT_PROMPT
+from app.scenarios.keyword_rules import match_keywords
 
-from utils.faiss_store import FaissStore
-from utils.bm25_store import BM25Store
+from app.core.stores.faiss_store import FaissStore
+from app.core.stores.bm25_store import BM25Store
 
 
 # -------------------------------

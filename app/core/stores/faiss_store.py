@@ -1,4 +1,4 @@
-# SCSC/utils/faiss_store.py
+# utils/faiss_store.py
 from __future__ import annotations
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union, Callable
@@ -255,7 +255,7 @@ class FaissStore:
         return inst
 
     # ----- 텍스트 검색 (generator가 호출: index.search(query, top_k)) -----
-    def search(self, query: str, top_k: int = 50, normalize: bool = False) -> List[Dict[str, Any]]:
+    def search(self, query: str, top_k: int = 50, normalize: bool = True) -> List[Dict[str, Any]]:
         """
         텍스트 쿼리를 임베딩 → FAISS 검색 → 상위 top_k 결과를 list[dict]로 반환.
         반환 dict 예시:
@@ -265,10 +265,11 @@ class FaissStore:
             raise RuntimeError("FAISS index가 로드되지 않았습니다. load() 먼저 호출하세요.")
         # 1) 쿼리 임베딩
         q_vec = self._embedder([query])
-        if normalize or _metric_of(self.index) == faiss.METRIC_L2:
-            q_vec = _l2_normalize(q_vec)
+        q_vec = _l2_normalize(q_vec)
+
         # 2) 벡터 검색
-        scores, ids = _search_by_vector(self.index, q_vec, top_k=top_k, assume_normalized=(not normalize))
+        scores, ids = _search_by_vector(self.index, q_vec, top_k=top_k, assume_normalized=True)
+
         # 3) 메타 매핑
         out: List[Dict[str, Any]] = []
         for s, i in zip(scores, ids):
@@ -327,8 +328,8 @@ def _search_by_vector(index: faiss.Index, q_vec: np.ndarray, top_k: int = 50, as
 
     dvals = [float(d) for d in D[0][:len(ids)]]
     if metric == faiss.METRIC_L2:
-        # 0~1 범위로 스케일: 거리가 0이면 1, 멀수록 0으로 감소
-        scores = [1.0 / (1.0 + d) for d in dvals]
+        # 단위벡터 전제 시: L2^2 = 2 - 2*cos  →  cos = 1 - 0.5 * L2^2
+        scores = [1.0 - 0.5 * d for d in dvals]
     else:
         # Inner Product는 이미 큰 값이 유사함을 의미하므로 그대로 사용
         scores = dvals

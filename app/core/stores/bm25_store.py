@@ -1,4 +1,3 @@
-# SCSC/utils/bm25_store.py
 from __future__ import annotations
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Union
