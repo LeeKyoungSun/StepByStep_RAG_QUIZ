@@ -1,9 +1,11 @@
 # app/core/moderation/moderation.py
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, Field
-from app.core.moderation.guard_engine import check_with_openai, SAFE_FALLBACK  # ⬅️ 추가
 
-# ===== 모델 =====
+# 안전 대체문(공용 상수) — guard_engine 이걸 참조
+SAFE_FALLBACK = "민감하거나 유해할 수 있는 내용이라 자세한 설명은 생략할게. 안전한 범위에서 다시 질문해줘."
+
+# ===== 공용 데이터 모델 =====
 class Decision(BaseModel):
     action: str               # allow | soft_block | hold | block
     reasons: List[str] = []
@@ -18,7 +20,7 @@ class TextBatchIn(BaseModel):
 
 class CheckResult(BaseModel):
     decision: Decision
-    safe_text: Optional[str] = None
+    safe_text: Optional[str] = None   # soft_block 시 대체문
     original: Optional[str] = None
 
 class CheckBatchResult(BaseModel):
@@ -32,14 +34,8 @@ class CommentGuardIn(BaseModel):
     content: str
 
 # ===== 공용 헬퍼 =====
-def guard_text(text: str, *, channel: str = "chat_input") -> Decision:
+def make_check_result(*, text: str, decision: Decision, safe_text: Optional[str]=None) -> CheckResult:
     """
-    channel: chat_input | chat_output | snippet | post | comment
+    라우터에서 공통으로 쓰는 Result 포매터.
     """
-    return check_with_openai(text, channel=channel)
-
-def make_check_result(text: str, *, channel: str) -> CheckResult:
-    dec = guard_text(text, channel=channel)
-    if dec.action == "soft_block":
-        return CheckResult(decision=dec, safe_text=SAFE_FALLBACK, original=text)
-    return CheckResult(decision=dec, original=text)
+    return CheckResult(decision=decision, safe_text=safe_text, original=text)
