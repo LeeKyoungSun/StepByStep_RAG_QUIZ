@@ -1,7 +1,7 @@
 # app/rag/prompts/prompts.py
 """
 시나리오(퀴즈) 생성 전용 프롬프트 모듈.
-답변용 프롬프트는 app/rag/prompts/prompts_lc.py 에서 관리합니다.
+답변용 프롬프트는 app/rag/prompts/prompts_lc.py 에서 관리
 """
 
 # 1) 말투 프리셋
