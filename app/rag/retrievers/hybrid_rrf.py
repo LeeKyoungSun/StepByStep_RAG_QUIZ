@@ -48,6 +48,8 @@ def _read_dirs_from_env() -> List[str]:
     if env_dirs:
         return [d.strip() for d in env_dirs.split(",") if d.strip()]
     fp = os.getenv("BM25_DIRS_FILE")
+    if fp and not os.path.isabs(fp):
+       fp = os.path.abspath(fp)
     if fp and Path(fp).exists():
         return [ln.strip() for ln in Path(fp).read_text(encoding="utf-8").splitlines() if ln.strip()]
     return []

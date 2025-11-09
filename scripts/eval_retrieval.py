@@ -6,7 +6,7 @@ from typing import List, Dict, Tuple
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=".env", override=True)
 
-# --- 내부 의존 (네 프로젝트 경로 그대로) ---
+# --- 내부 의존 ---
 sys.path.append(str(Path(__file__).resolve().parents[1]))  # 프로젝트 루트로
 from app.core.stores.faiss_store import FaissStore
 from app.core.stores.bm25_store import BM25Store
