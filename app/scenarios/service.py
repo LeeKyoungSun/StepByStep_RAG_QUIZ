@@ -1,15 +1,17 @@
 # app/scenarios/service.py
 """
-퀴즈 생성 서비스 (완전판)
-- RAG 검색 포함
-- 정답 위치 랜덤화
-- 해설 필수 포함
+개선된 퀴즈 생성 서비스
+- 문제 중복 방지
+- 다양한 스니펫 사용
+- 유사도 기반 중복 제거
 """
 import json
 import os
-from typing import Dict, Any, List, Optional
+import hashlib
+from typing import Dict, Any, List, Optional, Set
 from pathlib import Path
 from openai import OpenAI
+import random
 
 # RAG 관련
 try:
@@ -25,13 +27,14 @@ class Config:
 
     def __init__(self):
         self.index_root = "data/indexes"
-        self.topk = 6
+        self.topk = 12  # 더 많은 스니펫 가져오기 (중복 제거용)
         self.gen_model = "gpt-4o-mini"
+        self.diversity_threshold = 0.7  # 유사도 임계값
 
 
 class ScenarioService:
     """
-    퀴즈 생성 서비스 (RAG 포함)
+    개선된 퀴즈 생성 서비스
     """
 
     def __init__(self, cfg: Config):
@@ -42,6 +45,9 @@ class ScenarioService:
         self.index = None
         self.df = None
         self._init_rag()
+
+        # 중복 방지를 위한 임시 캐시 (요청당 초기화)
+        self.generated_questions: Set[str] = set()
 
     def _init_rag(self):
         """RAG 인덱스 초기화"""
@@ -54,10 +60,6 @@ class ScenarioService:
             index_file = faiss_dir / "index.faiss"
             ids_file = faiss_dir / "ids.npy"
             meta_json = faiss_dir / "meta.json"
-
-            #  논리 병합된 BM25 인덱스
-            bm25_file = index_path / "2022년성교육교재" / "bm25" / "bm25.pkl"
-            bm25_meta = index_path / "2022년성교육교재" / "bm25" / "meta.json"
 
             # ───────────────────────────────
             #  FAISS 인덱스 로드
@@ -72,10 +74,9 @@ class ScenarioService:
                 print(f"[경고] FAISS 인덱스를 찾을 수 없음: {index_file}")
 
             # ───────────────────────────────
-            #  메타데이터 로드 (meta.json → parquet → csv)
+            #  메타데이터 로드
             # ───────────────────────────────
             if meta_json.exists():
-                import json
                 with open(meta_json, "r", encoding="utf-8") as f:
                     meta = json.load(f)
                 self.df = pd.DataFrame(meta)
@@ -89,112 +90,168 @@ class ScenarioService:
             else:
                 print(f"[경고] 메타데이터를 찾을 수 없음: {meta_json}")
 
-            # ───────────────────────────────
-            #  BM25 인덱스 로드
-            # ───────────────────────────────
-            if bm25_file.exists():
-                import pickle
-                with open(bm25_file, "rb") as f:
-                    self.bm25 = pickle.load(f)
-                print(f"✓ BM25 인덱스 로드: {bm25_file}")
-            else:
-                print(f"[경고] BM25 인덱스를 찾을 수 없음: {bm25_file}")
-
-            if bm25_meta.exists():
-                print(f"✓ BM25 메타데이터 발견: {bm25_meta}")
-
         except Exception as e:
             print(f"[경고] RAG 초기화 실패: {e}")
 
     def pick_by_keyword(self, keyword: str, topk: int) -> List[Dict[str, Any]]:
         """
-        키워드로 관련 스니펫 검색
-
-        Args:
-            keyword: 검색 키워드
-            topk: 반환할 결과 수
-
-        Returns:
-            [{text, source, chunk_id, ...}, ...]
+        키워드로 관련 스니펫 검색 (개선: 다양성 확보)
         """
         if self.df is None or len(self.df) == 0:
             print(f"[경고] 메타데이터가 없어 검색 불가")
             return []
 
-        # 간단한 텍스트 매칭 (FAISS 없이도 동작)
-        if self.index is None:
-            print(f"[INFO] FAISS 없이 텍스트 매칭 사용")
-            return self._text_search(keyword, topk)
-
         # FAISS 벡터 검색
-        try:
-            # 키워드를 임베딩으로 변환 (OpenAI API)
-            response = self.client.embeddings.create(
-                model="text-embedding-3-small",
-                input=keyword
-            )
-            query_vec = np.array([response.data[0].embedding], dtype=np.float32)
+        if self.index is not None:
+            try:
+                return self._diverse_search(keyword, topk)
+            except Exception as e:
+                print(f"[경고] FAISS 검색 실패, 텍스트 매칭으로 폴백: {e}")
 
-            # 검색
-            distances, indices = self.index.search(query_vec, topk)
+        # 텍스트 검색 폴백
+        return self._diverse_text_search(keyword, topk)
 
-            results = []
-            for idx in indices[0]:
-                if idx < len(self.df):
-                    row = self.df.iloc[idx]
+    def _diverse_search(self, keyword: str, topk: int) -> List[Dict[str, Any]]:
+        """
+        다양성을 고려한 FAISS 검색
+        - 더 많은 결과를 가져온 후
+        - 유사도 기반으로 필터링하여 다양한 스니펫 선택
+        """
+        # 2배 많은 결과 가져오기
+        search_topk = topk * 2
+
+        # 키워드를 임베딩으로 변환
+        response = self.client.embeddings.create(
+            model="text-embedding-3-small",
+            input=keyword
+        )
+        query_vec = np.array([response.data[0].embedding], dtype=np.float32)
+
+        # 검색
+        distances, indices = self.index.search(query_vec, search_topk)
+
+        # 다양한 스니펫 선택
+        results = []
+        selected_texts = []
+
+        for idx, dist in zip(indices[0], distances[0]):
+            if len(results) >= topk:
+                break
+
+            if idx < len(self.df):
+                row = self.df.iloc[idx]
+                text = str(row.get("text", ""))
+
+                # 중복/유사 텍스트 체크
+                if self._is_diverse(text, selected_texts):
                     results.append({
-                        "text": str(row.get("text", "")),
+                        "text": text,
                         "source": str(row.get("source", "")),
                         "chunk_id": str(row.get("chunk_id", idx)),
+                        "index": int(idx),
+                        "distance": float(dist)
                     })
+                    selected_texts.append(text)
 
-            return results
+        # 부족하면 추가 샘플링
+        if len(results) < topk:
+            additional = self._sample_random_snippets(topk - len(results))
+            results.extend(additional)
 
-        except Exception as e:
-            print(f"[경고] FAISS 검색 실패, 텍스트 매칭으로 폴백: {e}")
-            return self._text_search(keyword, topk)
+        return results
 
-    def _text_search(self, keyword: str, topk: int) -> List[Dict[str, Any]]:
-        """텍스트 기반 검색 (폴백)"""
+    def _diverse_text_search(self, keyword: str, topk: int) -> List[Dict[str, Any]]:
+        """다양성을 고려한 텍스트 검색"""
         keyword_lower = keyword.lower()
 
-        # 키워드를 포함하는 행 찾기
+        # 키워드 포함 행 찾기
         matches = self.df[
             self.df["text"].str.lower().str.contains(keyword_lower, na=False)
         ]
 
         if len(matches) == 0:
             print(f"[경고] '{keyword}' 키워드가 포함된 자료를 찾을 수 없음")
-            # 전체에서 랜덤
-            matches = self.df.sample(min(topk, len(self.df)))
+            return self._sample_random_snippets(topk)
+
+        # 다양한 스니펫 선택
+        results = []
+        selected_texts = []
+
+        for idx, row in matches.iterrows():
+            if len(results) >= topk:
+                break
+
+            text = str(row.get("text", ""))
+
+            # 중복/유사 텍스트 체크
+            if self._is_diverse(text, selected_texts):
+                results.append({
+                    "text": text,
+                    "source": str(row.get("source", "")),
+                    "chunk_id": str(row.get("chunk_id", "")),
+                    "index": int(idx)
+                })
+                selected_texts.append(text)
+
+        # 부족하면 추가 샘플링
+        if len(results) < topk:
+            additional = self._sample_random_snippets(topk - len(results))
+            results.extend(additional)
+
+        return results
+
+    def _is_diverse(self, text: str, existing_texts: List[str]) -> bool:
+        """
+        텍스트가 기존 텍스트들과 충분히 다른지 확인
+        - 간단한 문자 기반 유사도 사용
+        """
+        if not existing_texts:
+            return True
+
+        # 간단한 Jaccard 유사도
+        text_set = set(text.lower().split())
+
+        for existing in existing_texts:
+            existing_set = set(existing.lower().split())
+
+            # 교집합 / 합집합
+            if len(text_set) == 0 or len(existing_set) == 0:
+                continue
+
+            intersection = len(text_set & existing_set)
+            union = len(text_set | existing_set)
+
+            similarity = intersection / union if union > 0 else 0
+
+            # 너무 유사하면 거부
+            if similarity > self.cfg.diversity_threshold:
+                return False
+
+        return True
+
+    def _sample_random_snippets(self, count: int) -> List[Dict[str, Any]]:
+        """랜덤 스니펫 샘플링 (간소화)"""
+        if self.df is None or len(self.df) == 0:
+            return []
+
+        # 랜덤 샘플링
+        sample_size = min(count, len(self.df))
+        sample = self.df.sample(sample_size)
 
         results = []
-        for _, row in matches.head(topk).iterrows():
+        for idx, row in sample.iterrows():
             results.append({
                 "text": str(row.get("text", "")),
                 "source": str(row.get("source", "")),
                 "chunk_id": str(row.get("chunk_id", "")),
+                "index": int(idx)
             })
 
         return results
 
     def random_snippets(self, topk: int) -> List[Dict[str, Any]]:
         """랜덤 스니펫 선택"""
-        if self.df is None or len(self.df) == 0:
-            print(f"[경고] 메타데이터가 없어 랜덤 선택 불가")
-            return []
-
-        sample = self.df.sample(min(topk, len(self.df)))
-
-        results = []
-        for _, row in sample.iterrows():
-            results.append({
-                "text": str(row.get("text", "")),
-                "source": str(row.get("source", "")),
-                "chunk_id": str(row.get("chunk_id", "")),
-            })
-
-        return results
+        return self._sample_random_snippets(topk)
 
     def make_quiz_item(
             self,
@@ -205,17 +262,17 @@ class ScenarioService:
     ) -> Dict[str, Any]:
         """
         개선된 퀴즈 생성
-        - 정답 위치 랜덤화 (강제)
+        - 중복 문제 방지
+        - 정답 위치 랜덤화
         - 해설 포함
         """
-        import random
         from app.rag.prompts.prompts import get_prompt, QUESTION_TYPES
         from app.rag.validator import validate_quiz, normalize_quiz
 
         qtype = force_type or random.choice(["situation", "concept"])
         topic = concept_topic or keyword or "핵심 개념"
 
-        #  정답 위치 랜덤 선택 (0-3)
+        # 정답 위치 랜덤 선택
         target_position = random.randint(0, 3)
 
         # 질문 형식 랜덤 선택
@@ -223,11 +280,21 @@ class ScenarioService:
         if qtype == "concept":
             question_type = random.choice(QUESTION_TYPES)
 
-        # FACTS 생성
+        # FACTS 생성 (다양한 스니펫 사용)
         context = self._mk_facts(snips, max_chars=1200)
 
-        # LLM 호출 (최대 3회 재시도)
-        max_retry = 3
+        # 이전 생성 문제 정보
+        previous_questions_hint = ""
+        if self.generated_questions:
+            # 최근 3개 문제 샘플
+            recent = list(self.generated_questions)[-3:]
+            previous_questions_hint = (
+                    "\n\n**중요: 다음 문제들과 중복되지 않도록 완전히 다른 상황/개념으로 출제:**\n"
+                    + "\n".join([f"- {q[:80]}..." for q in recent])
+            )
+
+        # LLM 호출
+        max_retry = 1
         previous_errors = []
 
         for attempt in range(max_retry):
@@ -244,7 +311,7 @@ class ScenarioService:
                     context=context,
                     correct_position=target_position,
                     question_type=question_type
-                ) + error_feedback
+                ) + error_feedback + previous_questions_hint
 
                 # LLM 호출
                 response = self._call_llm(prompt)
@@ -253,7 +320,14 @@ class ScenarioService:
                 # 정규화
                 item = normalize_quiz(item)
 
-                #  정답 위치 강제 조정
+                # 중복 체크
+                question_hash = self._hash_question(item["question"])
+                if question_hash in self.generated_questions:
+                    print(f"[시도 {attempt + 1}/{max_retry}] 중복 문제 감지, 재생성")
+                    previous_errors.append("중복 문제")
+                    continue
+
+                # 정답 위치 강제 조정
                 actual_position = item.get("correct_index", 0)
                 if actual_position != target_position:
                     print(f"[자동 수정] 정답 위치: {actual_position} → {target_position}")
@@ -271,6 +345,9 @@ class ScenarioService:
                     item["sources"] = self._extract_sources(snips)
                     item["correct_label"] = ["A", "B", "C", "D"][item["correct_index"]]
 
+                    # 캐시에 추가
+                    self.generated_questions.add(question_hash)
+
                     return item
                 else:
                     previous_errors = errors
@@ -284,15 +361,19 @@ class ScenarioService:
         print(f"[경고] {max_retry}회 시도 실패. 기본 문제 생성")
         return self._create_fallback_item(qtype, keyword, topic, snips, target_position)
 
+    def _hash_question(self, question: str) -> str:
+        """문제 해시 생성 (중복 체크용)"""
+        # 공백과 특수문자 제거 후 해시
+        normalized = "".join(question.lower().split())
+        return hashlib.md5(normalized.encode()).hexdigest()
+
     def _fix_answer_position(
             self,
             item: Dict[str, Any],
             current_pos: int,
             target_pos: int
     ) -> Dict[str, Any]:
-        """
-        정답 위치를 강제로 조정
-        """
+        """정답 위치를 강제로 조정"""
         choices = item.get("choices", [])
         if len(choices) != 4:
             return item
@@ -318,28 +399,6 @@ class ScenarioService:
                 "chunk_id": str(s.get("chunk_id", ""))
             })
         return sources
-
-    def _build_error_feedback(self, errors: List[str], qtype: str) -> str:
-        """검증 실패 에러에 대한 구체적 피드백 생성"""
-        if not errors:
-            return ""
-
-        feedback_lines = ["\n\n**이전 시도의 문제점과 개선 방향:**"]
-
-        for error in errors[-3:]:
-            if "정답에 근거/이유가 부족함" in error:
-                feedback_lines.append(
-                    "- 정답에 근거/이유 부족: "
-                    "'때문에', '이므로', '하므로' 등 인과관계 표현 포함 필요"
-                )
-            elif "해설이 없음" in error or "해설이 너무 짧음" in error:
-                feedback_lines.append("-  해설 부족: 2-4문장으로 작성 필요")
-            elif "보기가 4개가 아님" in error:
-                feedback_lines.append("-  보기가 4개가 아님")
-            else:
-                feedback_lines.append(f"-  {error}")
-
-        return "\n".join(feedback_lines)
 
     def _call_llm(self, prompt: str) -> str:
         """LLM 호출"""
@@ -371,7 +430,6 @@ class ScenarioService:
                 text = text[4:]
         return json.loads(text)
 
-
     def _mk_facts(self, snips: List[Dict[str, Any]], max_chars: int = 1200) -> str:
         """RAG 스니펫을 FACTS 형식으로 변환"""
         facts = []
@@ -400,8 +458,6 @@ class ScenarioService:
             correct_position: int
     ) -> Dict[str, Any]:
         """폴백: LLM 실패 시 기본 문제 생성"""
-        import random
-
         choices_template = [
             f"{topic}에 대한 부정확한 설명이다.",
             f"{topic}의 일부 특징만 언급한 불완전한 설명이다.",
@@ -413,9 +469,15 @@ class ScenarioService:
         correct_answer = choices_template.pop(3)
         choices_template.insert(correct_position, correct_answer)
 
+        question = f"{topic}에 대한 설명으로 옳은 것은? (생성 ID: {random.randint(1000, 9999)})"
+
+        # 캐시에 추가
+        question_hash = self._hash_question(question)
+        self.generated_questions.add(question_hash)
+
         return {
             "type": qtype,
-            "question": f"{topic}에 대한 설명으로 옳은 것은?",
+            "question": question,
             "choices": choices_template,
             "correct_index": correct_position,
             "correct_label": ["A", "B", "C", "D"][correct_position],
@@ -431,6 +493,7 @@ def get_service() -> ScenarioService:
     """서비스 팩토리"""
     cfg = Config()
     cfg.index_root = os.getenv("SCENARIO_INDEX_ROOT", "data/indexes")
-    cfg.topk = int(os.getenv("SCENARIO_TOPK", "6"))
+    cfg.topk = int(os.getenv("SCENARIO_TOPK", "12"))  # 더 많이 가져오기
     cfg.gen_model = os.getenv("GEN_MODEL", "gpt-4o-mini")
+    cfg.diversity_threshold = float(os.getenv("DIVERSITY_THRESHOLD", "0.7"))
     return ScenarioService(cfg)
